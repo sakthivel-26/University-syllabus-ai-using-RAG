@@ -1,248 +1,169 @@
-"""Streamlit frontend for University Syllabus AI Assistant."""
-from dotenv import load_dotenv
-load_dotenv()
-
-import streamlit as st
-from pathlib import Path
-import tempfile
 import os
-from typing import List
+import asyncio
+import json
+import hashlib
+import shutil
+from typing import List, Tuple
 
-from src.config import Config
-from src.document_processor import DocumentProcessor
-from src.vector_store import SyllabusVectorStore
-from src.rag_pipeline import RAGPipeline
+import gradio as gr
+import numpy as np
+import faiss
+import requests
+from sentence_transformers import SentenceTransformer
+import fitz  # PyMuPDF
 
-# Page configuration
-st.set_page_config(
-    page_title="University Syllabus AI Assistant",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ---------------- Azure OpenAI Config ----------------
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 
-# Initialize session state
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
-if "rag_pipeline" not in st.session_state:
-    st.session_state.rag_pipeline = None
-if "processed_files" not in st.session_state:
-    st.session_state.processed_files = set()
-if "documents_loaded" not in st.session_state:
-    st.session_state.documents_loaded = False
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+CACHE_DIR = "./cache"
 
+SYSTEM_PROMPT = """
+You are a university-level academic assistant.
+Explain answers clearly with structured reasoning.
+Use simple but formal academic language.
+Provide accurate, well-structured explanations.
+"""
 
-def initialize_components():
-    """Initialize vector store and RAG pipeline."""
-    try:
-        if st.session_state.vector_store is None:
-            with st.spinner("Initializing vector store..."):
-                st.session_state.vector_store = SyllabusVectorStore()
-                st.session_state.rag_pipeline = RAGPipeline(st.session_state.vector_store)
-        return True
-    except Exception as e:
-        st.error(f"Error initializing components: {str(e)}")
-        st.info("Please check your configuration in .env file")
-        return False
+os.makedirs(CACHE_DIR, exist_ok=True)
 
+embedder = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
-def process_uploaded_pdfs(uploaded_files: List) -> bool:
-    """
-    Process uploaded PDF files and add them to the vector store.
-    
-    Args:
-        uploaded_files: List of uploaded file objects
-        
-    Returns:
-        True if processing was successful, False otherwise
-    """
-    if not uploaded_files:
-        return False
-    
-    if not initialize_components():
-        return False
-    
-    processor = DocumentProcessor()
-    vector_store = st.session_state.vector_store
-    
-    success_count = 0
-    skipped_count = 0
-    
-    with st.spinner("Processing PDFs..."):
-        for uploaded_file in uploaded_files:
-            try:
-                # Check if file was already processed
-                if uploaded_file.name in st.session_state.processed_files:
-                    skipped_count += 1
-                    continue
-                
-                # Save uploaded file temporarily
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                    tmp_file.write(uploaded_file.getvalue())
-                    tmp_path = Path(tmp_file.name)
-                
-                try:
-                    # Get document hash to check if already exists
-                    doc_hash = processor.get_document_hash(tmp_path)
-                    
-                    if vector_store.document_exists(doc_hash):
-                        st.info(f"📄 {uploaded_file.name} already exists in the database. Skipping...")
-                        skipped_count += 1
-                        st.session_state.processed_files.add(uploaded_file.name)
-                        continue
-                    
-                    # Process PDF
-                    documents = processor.process_pdf(tmp_path)
-                    
-                    if documents:
-                        # Add to vector store
-                        vector_store.add_documents(documents)
-                        success_count += 1
-                        st.session_state.processed_files.add(uploaded_file.name)
-                        st.success(f"✅ Successfully processed: {uploaded_file.name} ({len(documents)} chunks)")
-                    else:
-                        st.warning(f"⚠️ No content extracted from: {uploaded_file.name}")
-                
-                finally:
-                    # Clean up temporary file
-                    if tmp_path.exists():
-                        os.unlink(tmp_path)
-            
-            except Exception as e:
-                st.error(f"❌ Error processing {uploaded_file.name}: {str(e)}")
-    
-    if success_count > 0:
-        st.session_state.documents_loaded = True
-        st.balloons()
-    
-    return success_count > 0
+DOCS: List[str] = []
+FILENAMES: List[str] = []
+EMBEDDINGS: np.ndarray = None
+FAISS_INDEX = None
 
 
-def main():
-    """Main application function."""
-    # Title and description
-    st.title("📚 University Syllabus AI Assistant")
-    st.markdown("""
-    Upload your syllabus PDF documents and ask questions about course content, 
-    requirements, schedules, and more. The AI will answer based solely on your uploaded documents.
-    """)
-    
-    # Sidebar
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        
-        # Display current configuration
-        st.subheader("Current Settings")
-        st.text(f"Embeddings: sentence-transformers ({Config.EMBEDDING_MODEL_NAME})")
-        st.text(f"LLM Provider: openrouter")
-        st.text(f"LLM Model: {Config.LLM_MODEL}")
-        
-        # Collection info
-        if st.session_state.vector_store:
-            info = st.session_state.vector_store.get_collection_info()
-            st.subheader("📊 Database Info")
-            st.text(f"Documents: {info['document_count']}")
-            st.text(f"Collection: {info['collection_name']}")
-        
-        st.divider()
-        
-        # Initialize button
-        if st.button("🔄 Initialize System", use_container_width=True):
-            try:
-                st.session_state.vector_store = None
-                st.session_state.rag_pipeline = None
-                initialize_components()
-                st.success("System initialized!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Initialization error: {str(e)}")
-        
-        # Clear database button
-        if st.button("🗑️ Clear Database", use_container_width=True):
-            if st.session_state.vector_store:
-                st.session_state.vector_store.delete_collection()
-                st.session_state.processed_files.clear()
-                st.session_state.documents_loaded = False
-                st.success("Database cleared!")
-                st.rerun()
-    
-    # Initialize components
-    if not initialize_components():
-        st.stop()
-    
-    # Main content area
-    tab1, tab2 = st.tabs(["📤 Upload Documents", "❓ Ask Questions"])
-    
-    with tab1:
-        st.header("Upload Syllabus PDFs")
-        st.markdown("Upload one or more PDF files containing syllabus information.")
-        
-        uploaded_files = st.file_uploader(
-            "Choose PDF files",
-            type=["pdf"],
-            accept_multiple_files=True,
-            help="Select one or more PDF files to upload"
-        )
-        
-        if uploaded_files:
-            if st.button("📥 Process PDFs", type="primary", use_container_width=True):
-                process_uploaded_pdfs(uploaded_files)
-    
-    with tab2:
-        st.header("Ask Questions")
-        
-        # Check if documents are loaded
-        if not st.session_state.documents_loaded:
-            info = st.session_state.vector_store.get_collection_info()
-            if info['document_count'] == 0:
-                st.warning("⚠️ No documents loaded. Please upload PDF files in the 'Upload Documents' tab first.")
-            else:
-                st.session_state.documents_loaded = True
-        
-        if st.session_state.documents_loaded:
-            # Question input
-            question = st.text_area(
-                "Enter your question:",
-                height=100,
-                placeholder="e.g., What are the course prerequisites? What is the grading policy? When are the exams scheduled?"
-            )
-            
-            col1, col2 = st.columns([1, 5])
-            with col1:
-                ask_button = st.button("🔍 Ask", type="primary", use_container_width=True)
-            
-            if ask_button and question:
-                with st.spinner("Searching documents and generating answer..."):
-                    result = st.session_state.rag_pipeline.answer_question(question)
-                    
-                    # Display answer
-                    st.subheader("💡 Answer")
-                    st.markdown(result["answer"])
-                    
-                    # Display sources
-                    if result.get("sources"):
-                        st.divider()
-                        st.subheader("📑 Source Documents")
-                        
-                        for idx, source in enumerate(result["sources"], 1):
-                            with st.expander(f"Source {idx}: {source['filename']}"):
-                                st.text(f"Chunk Index: {source['chunk_index']}")
-                                st.text("Preview:")
-                                st.text(source['preview'])
-            
-            elif ask_button:
-                st.warning("Please enter a question.")
-        else:
-            st.info("👆 Upload documents in the 'Upload Documents' tab to start asking questions.")
+# ---------------- PDF Extraction ----------------
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    return "\n".join(page.get_text() for page in doc)
 
+
+# ---------------- FAISS ----------------
+def build_faiss(emb: np.ndarray):
+    global FAISS_INDEX
+    index = faiss.IndexFlatL2(emb.shape[1])
+    index.add(emb.astype("float32"))
+    FAISS_INDEX = index
+
+
+def search(query: str, k: int = 3):
+    if FAISS_INDEX is None:
+        return []
+
+    q_emb = embedder.encode([query], convert_to_numpy=True).astype("float32")
+    D, I = FAISS_INDEX.search(q_emb, k)
+
+    results = []
+    for i in I[0]:
+        if i >= 0:
+            results.append({
+                "text": DOCS[i][:15000],
+                "source": FILENAMES[i]
+            })
+    return results
+
+
+# ---------------- Azure OpenAI Call ----------------
+def call_azure_openai(prompt: str):
+
+    if not AZURE_OPENAI_API_KEY:
+        return "Azure API key missing."
+
+    url = f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version={AZURE_OPENAI_API_VERSION}"
+
+    headers = {
+        "Content-Type": "application/json",
+        "api-key": AZURE_OPENAI_API_KEY,
+    }
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1000
+    }
+
+    response = requests.post(url, headers=headers, json=payload, timeout=60)
+
+    if response.status_code != 200:
+        return f"Azure error: {response.text}"
+
+    data = response.json()
+    return data["choices"][0]["message"]["content"]
+
+
+# ---------------- Upload & Index ----------------
+def upload_and_index(files):
+    global DOCS, FILENAMES, EMBEDDINGS
+
+    if not files:
+        return "No files uploaded."
+
+    DOCS = []
+    FILENAMES = []
+
+    for f in files:
+        with open(f.name, "rb") as file:
+            content = file.read()
+        DOCS.append(extract_text_from_pdf(content))
+        FILENAMES.append(f.name)
+
+    EMBEDDINGS = embedder.encode(DOCS, convert_to_numpy=True)
+    build_faiss(EMBEDDINGS)
+
+    return f"Indexed {len(DOCS)} PDFs successfully."
+
+
+# ---------------- Ask Question ----------------
+def ask(question):
+    if not DOCS:
+        return "Upload PDFs first."
+
+    results = search(question)
+
+    context = "\n\n".join(
+        f"Source: {r['source']}\n{r['text']}" for r in results
+    )
+
+    prompt = f"""
+Use the academic context below to answer clearly.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Provide a well-structured university-level explanation.
+"""
+
+    return call_azure_openai(prompt)
+
+
+# ---------------- Gradio UI ----------------
+with gr.Blocks(title="Azure PDF RAG Bot") as demo:
+    gr.Markdown("# 🎓 University-Level PDF RAG Bot (Azure OpenAI GPT-4.1)")
+
+    file_input = gr.File(file_count="multiple", file_types=[".pdf"])
+    upload_btn = gr.Button("Upload & Index")
+    status = gr.Textbox(label="Status")
+
+    upload_btn.click(upload_and_index, inputs=file_input, outputs=status)
+
+    gr.Markdown("## Ask a Question")
+    question = gr.Textbox(lines=3)
+    ask_btn = gr.Button("Ask")
+    answer = gr.Textbox(lines=15)
+
+    ask_btn.click(ask, inputs=question, outputs=answer)
 
 if __name__ == "__main__":
-    # Validate configuration on startup
-    try:
-        Config.validate()
-    except ValueError as e:
-        st.error(f"Configuration Error: {str(e)}")
-        st.info("Please create a .env file with the required configuration. See .env.example for reference.")
-        st.stop()
-    
-    main()
+    demo.launch()
